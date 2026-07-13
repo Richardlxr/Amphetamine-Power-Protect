@@ -39,3 +39,9 @@ Amphetamine should now recognize that Power Protect is installed. If a Closed-Di
 ```
 /private/etc/sudoers.d/amphetamine_powerProtect
 ```
+
+## Optional reassertion watchdog
+
+If `pmset -g` shows `SleepDisabled` returning to `0` while an Amphetamine Closed-Display Mode session is still active—typically after changing power sources or disconnecting a powered display—the optional [Power Protect Watchdog](Source/Watchdog/README.md) can restore the setting and prevent a `Clamshell Sleep` / `DarkWake` loop.
+
+The watchdog only manages the setting while Amphetamine owns an active system-sleep assertion. It restores normal sleep when the session ends and includes a configurable low-battery cutoff.
