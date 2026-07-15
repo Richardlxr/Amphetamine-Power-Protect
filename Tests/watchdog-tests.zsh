@@ -75,6 +75,15 @@ EOF
   fi
 }
 
+append_assertion_noise() {
+  local line
+  {
+    for line in {1..5000}; do
+      print -r -- "   pid $line(other): [0x2] 00:00:01 BackgroundTask named: \"test assertion $line\""
+    done
+  } >> "$FAKE_PMSET_ASSERTIONS"
+}
+
 setup_case() {
   local name="$1"
   local initial_sleep_disabled="$2"
@@ -146,6 +155,11 @@ setup_case active_session 0
 run_watchdog_once
 assert_equal 1 "$(<"$FAKE_PMSET_STATE")" "active session should restore SleepDisabled"
 assert_exists "$POWER_PROTECT_STATE_DIR/sleep-disabled-owned" "active session should record ownership"
+
+setup_case active_session_large_assertion_output 0
+append_assertion_noise
+run_watchdog_once
+assert_equal 1 "$(<"$FAKE_PMSET_STATE")" "large assertion output must not hide the active Amphetamine session"
 
 setup_case unowned_inactive 1
 set_session inactive
