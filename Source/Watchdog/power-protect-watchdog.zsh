@@ -11,6 +11,8 @@ readonly OWNED_MARKER="$STATE_DIR/sleep-disabled-owned"
 readonly ARMED_SESSION="$STATE_DIR/armed-session"
 readonly LOW_BATTERY_LATCH="$STATE_DIR/low-battery-latched"
 readonly DISABLED_CLEANED_MARKER="$STATE_DIR/disabled-cleaned"
+readonly SAFE_INACTIVE_BASELINE="$STATE_DIR/safe-inactive-baseline"
+readonly ARM_CANDIDATE="$STATE_DIR/arm-candidate"
 readonly RUN_LOCK="$STATE_DIR/run.lock"
 readonly LOG_FILE="$STATE_DIR/activity.log"
 readonly PMSET_BIN="${POWER_PROTECT_PMSET:-/usr/bin/pmset}"
@@ -22,6 +24,8 @@ readonly POLL_SECONDS=2
 readonly MAX_BACKOFF_SECONDS=30
 readonly LOG_REPEAT_SECONDS=60
 readonly MAX_LOG_BYTES=1048576
+readonly SAFE_BASELINE_MAX_AGE_SECONDS=10
+readonly ARM_WINDOW_SECONDS=15
 
 typeset -g CONFIG_ENABLED=""
 typeset -g CONFIG_RESET_INACTIVE=""
@@ -162,7 +166,54 @@ release_sleep_override() {
 }
 
 clear_session_state() {
-  /bin/rm -f "$ARMED_SESSION" "$LOW_BATTERY_LATCH" || return 1
+  /bin/rm -f "$ARMED_SESSION" "$LOW_BATTERY_LATCH" "$ARM_CANDIDATE" || return 1
+}
+
+clear_arm_evidence() {
+  /bin/rm -f "$SAFE_INACTIVE_BASELINE" "$ARM_CANDIDATE" || return 1
+}
+
+epoch_seconds() {
+  /bin/date '+%s'
+}
+
+record_safe_inactive_baseline() {
+  "$TOUCH_BIN" "$SAFE_INACTIVE_BASELINE" || return 1
+  /bin/rm -f "$ARM_CANDIDATE" || return 1
+}
+
+safe_inactive_baseline_is_recent() {
+  local modified now
+  [[ -f "$SAFE_INACTIVE_BASELINE" ]] || return 1
+  modified=$(/usr/bin/stat -f '%m' "$SAFE_INACTIVE_BASELINE" 2>/dev/null) || return 1
+  now=$(epoch_seconds) || return 1
+  [[ "$modified" == <-> && "$now" == <-> ]] || return 1
+  (( now >= modified && now - modified <= SAFE_BASELINE_MAX_AGE_SECONDS ))
+}
+
+write_arm_candidate() {
+  local identity="$1"
+  local now deadline temporary
+  now=$(epoch_seconds) || return 1
+  deadline=$(( now + ARM_WINDOW_SECONDS ))
+  temporary="$ARM_CANDIDATE.tmp.$$"
+  print -r -- "$identity $deadline" > "$temporary" || return 1
+  /bin/mv -f "$temporary" "$ARM_CANDIDATE" || {
+    /bin/rm -f "$temporary"
+    return 1
+  }
+}
+
+read_arm_candidate() {
+  local identity deadline now
+  [[ -f "$ARM_CANDIDATE" ]] || return 1
+  read -r identity deadline < "$ARM_CANDIDATE" || return 1
+  now=$(epoch_seconds) || return 1
+  if [[ -z "$identity" || "$deadline" != <-> || "$now" != <-> || "$now" -gt "$deadline" ]]; then
+    /bin/rm -f "$ARM_CANDIDATE" || true
+    return 1
+  fi
+  print -r -- "$identity"
 }
 
 read_armed_session() {
@@ -236,6 +287,7 @@ handle_disabled() {
   fi
 
   clear_session_state || return 1
+  clear_arm_evidence || return 1
   if ! "$TOUCH_BIN" "$DISABLED_CLEANED_MARKER"; then
     log_message "ERROR: could not record disabled cleanup"
     return 1
@@ -252,22 +304,25 @@ cleanup_for_exit() {
   fi
 
   clear_session_state || return 1
+  clear_arm_evidence || return 1
 }
 
 reconcile() {
-  local assertion_identity assertion_status current_sleep armed_identity
+  local assertion_identity assertion_status current_sleep armed_identity candidate_identity
   local battery_status source percent
 
   if ! load_config; then
     log_message "ERROR: watchdog configuration is invalid or unreadable"
     cleanup_owned_state "invalid watchdog configuration" || return 1
     clear_session_state || return 1
+    clear_arm_evidence || return 1
     return 1
   fi
 
   if ! is_active_console_user; then
     cleanup_owned_state "user is not the active console user" || return 1
     /bin/rm -f "$LOW_BATTERY_LATCH" || return 1
+    clear_arm_evidence || return 1
     return 0
   fi
 
@@ -290,6 +345,12 @@ reconcile() {
       cleanup_owned_state "Amphetamine session inactive" || return 1
     fi
     clear_session_state || return 1
+    current_sleep=$(sleep_disabled_value) || current_sleep=""
+    if [[ "$current_sleep" == "0" ]]; then
+      record_safe_inactive_baseline || return 1
+    else
+      clear_arm_evidence || return 1
+    fi
     return 0
   elif [[ "$assertion_status" -ne 0 ]]; then
     log_message "ERROR: Amphetamine assertion state is unavailable"
@@ -299,6 +360,7 @@ reconcile() {
       cleanup_owned_state "Amphetamine assertion state unavailable" || return 1
     fi
     clear_session_state || return 1
+    clear_arm_evidence || return 1
     return 1
   fi
 
@@ -311,30 +373,49 @@ reconcile() {
       cleanup_owned_state "SleepDisabled state unavailable" || return 1
     fi
     clear_session_state || return 1
+    clear_arm_evidence || return 1
     return 1
   fi
 
   armed_identity=$(read_armed_session) || armed_identity=""
   if [[ -n "$armed_identity" && "$armed_identity" != "$assertion_identity" ]]; then
-    if [[ "$current_sleep" == "1" ]]; then
+    cleanup_owned_state "Amphetamine assertion identity changed" || return 1
+    clear_session_state || return 1
+    clear_arm_evidence || return 1
+    log_message "Amphetamine assertion changed; restart the Closed-Display Mode session to re-arm safely"
+    return 0
+  fi
+
+  candidate_identity=$(read_arm_candidate) || candidate_identity=""
+  if [[ -n "$candidate_identity" && "$candidate_identity" != "$assertion_identity" ]]; then
+    clear_arm_evidence || return 1
+    candidate_identity=""
+  fi
+
+  if [[ -z "$armed_identity" ]]; then
+    if [[ "$current_sleep" == "1" ]] &&
+       { safe_inactive_baseline_is_recent || [[ "$candidate_identity" == "$assertion_identity" ]]; }; then
       arm_session "$assertion_identity" || {
-        release_sleep_override "could not safely transfer armed session"
+        release_sleep_override "could not safely arm session"
+        clear_arm_evidence
         return 1
       }
-      /bin/rm -f "$LOW_BATTERY_LATCH" || return 1
+      clear_arm_evidence || return 1
       armed_identity="$assertion_identity"
-    else
-      /bin/rm -f "$ARMED_SESSION" "$OWNED_MARKER" "$LOW_BATTERY_LATCH" || return 1
-      armed_identity=""
+    elif [[ "$current_sleep" == "0" ]] && safe_inactive_baseline_is_recent; then
+      write_arm_candidate "$assertion_identity" || return 1
+      /bin/rm -f "$SAFE_INACTIVE_BASELINE" || return 1
+      candidate_identity="$assertion_identity"
+      log_message "Observed new Amphetamine assertion; waiting for Power Protect transition"
+    elif [[ "$current_sleep" == "1" ]]; then
+      log_message "Skipped watchdog arming because no recent safe inactive baseline was observed"
     fi
   fi
 
-  if [[ -z "$armed_identity" && "$current_sleep" == "1" ]]; then
-    arm_session "$assertion_identity" || {
-      release_sleep_override "could not safely arm session"
-      return 1
-    }
-    armed_identity="$assertion_identity"
+  # Power and low-battery fail-safes may only change global sleep state after
+  # this watchdog has positively armed the current assertion identity.
+  if [[ "$armed_identity" != "$assertion_identity" ]]; then
+    return 0
   fi
 
   battery_status=$("$PMSET_BIN" -g batt 2>/dev/null) || battery_status=""
@@ -385,7 +466,7 @@ reconcile() {
 
 print_status() {
   local config_state="unreadable" active="unreadable" console="no"
-  local assertion_identity assertion_status battery_status source percent sleep_value armed_identity
+  local assertion_identity assertion_status battery_status source percent sleep_value armed_identity candidate_identity
 
   if load_config; then
     config_state="$CONFIG_ENABLED"
@@ -405,6 +486,7 @@ print_status() {
   percent=$(battery_percent "$battery_status")
   sleep_value=$(sleep_disabled_value) || sleep_value="unreadable"
   armed_identity=$(read_armed_session) || armed_identity=""
+  candidate_identity=$(read_arm_candidate) || candidate_identity=""
 
   print -r -- "AmphetamineSessionActive=$active"
   print -r -- "AmphetamineAssertion=${assertion_identity:-none}"
@@ -416,6 +498,8 @@ print_status() {
   print -r -- "LowBatteryThreshold=${CONFIG_LOW_BATTERY_PERCENT:-unreadable}"
   print -r -- "SleepDisabled=$sleep_value"
   print -r -- "ArmedSession=${armed_identity:-none}"
+  print -r -- "ArmCandidate=${candidate_identity:-none}"
+  print -r -- "SafeInactiveBaseline=$([[ -e "$SAFE_INACTIVE_BASELINE" ]] && print yes || print no)"
   print -r -- "WatchdogOwnsState=$([[ -e "$OWNED_MARKER" ]] && print yes || print no)"
   print -r -- "LowBatteryLatched=$([[ -e "$LOW_BATTERY_LATCH" ]] && print yes || print no)"
 }
