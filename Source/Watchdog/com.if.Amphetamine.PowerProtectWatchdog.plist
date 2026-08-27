@@ -6,9 +6,8 @@
     <string>com.if.Amphetamine.PowerProtectWatchdog</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/bin/zsh</string>
-        <string>-c</string>
-        <string>exec ~/Library/Application\ Support/Amphetamine/Power\ Protect\ Watchdog/power-protect-watchdog.zsh run</string>
+        <string>__POWER_PROTECT_WATCHDOG_PATH__</string>
+        <string>run</string>
     </array>
     <key>RunAtLoad</key>
     <true/>

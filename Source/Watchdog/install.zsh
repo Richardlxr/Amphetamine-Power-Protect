@@ -56,6 +56,7 @@ fi
 /bin/mkdir -p "$INSTALL_DIR" "$LAUNCH_AGENT_DIR"
 /usr/bin/install -m 700 "$SOURCE_DIR/power-protect-watchdog.zsh" "$INSTALL_DIR/power-protect-watchdog.zsh"
 /usr/bin/install -m 644 "$SOURCE_DIR/com.if.Amphetamine.PowerProtectWatchdog.plist" "$LAUNCH_AGENT"
+/usr/libexec/PlistBuddy -c "Set :ProgramArguments:0 $INSTALL_DIR/power-protect-watchdog.zsh" "$LAUNCH_AGENT"
 
 if [[ ! -f "$INSTALL_DIR/config.plist" ]]; then
   /usr/bin/install -m 600 "$SOURCE_DIR/config.plist" "$INSTALL_DIR/config.plist"

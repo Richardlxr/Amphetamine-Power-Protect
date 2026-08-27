@@ -7,6 +7,6 @@
     <key>LowBatteryPercent</key>
     <integer>35</integer>
     <key>ResetSleepWhenInactive</key>
-    <true/>
+    <false/>
 </dict>
 </plist>

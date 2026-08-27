@@ -9,7 +9,8 @@ This optional watchdog closes that reassertion gap. Every two seconds it checks 
 - Records both an assertion identity and an ownership marker before managing `SleepDisabled`.
 - Leaves ordinary Amphetamine sessions unarmed when Power Protect has not enabled closed-display operation.
 - Restores `SleepDisabled=0` when the Amphetamine session ends or when the watchdog transitions to disabled.
-- By default, repairs an unowned `SleepDisabled=1` while Amphetamine is inactive, preventing a stale Power Protect state from leaving the Mac awake.
+- Repairs watchdog-owned `SleepDisabled=1` when the matching Amphetamine session ends. It does not reset an unowned global power setting by default.
+- Arms only after observing a safe inactive baseline followed by a new Amphetamine assertion and Power Protect's `SleepDisabled=1` transition. A pre-existing `SleepDisabled=1` is not treated as proof of closed-display intent.
 - Restores system sleep at or below the configured low-battery threshold (35% by default).
 - Keeps low-battery protection latched until AC power returns or the Amphetamine session ends.
 - Fails safe if power, assertion, configuration, marker, or `pmset` verification becomes unavailable.
@@ -41,7 +42,7 @@ The configuration file is located at:
 
 Set `Enabled` to `false` to stop managing Closed-Display Mode. The enabled-to-disabled transition performs one cleanup, then records that cleanup so the disabled watchdog does not continuously fight another power manager. Change `LowBatteryPercent` to a value from 5 through 95 to adjust the safety threshold. Invalid or unreadable configuration fails the health check and releases watchdog-managed state.
 
-`ResetSleepWhenInactive` defaults to `true`. Set it to `false` only if another tool intentionally uses `pmset disablesleep` while Amphetamine has no active session; watchdog-owned state is still cleaned up.
+`ResetSleepWhenInactive` defaults to `false`, so the watchdog does not overwrite an unowned global power setting. Watchdog-owned state is still cleaned up. Set it to `true` only if this Mac does not use any other tool or administrator-managed workflow that intentionally sets `pmset disablesleep` and you want stale, unowned state reset while Amphetamine is inactive.
 
 Changes are read on every reconciliation and do not require restarting the LaunchAgent.
 

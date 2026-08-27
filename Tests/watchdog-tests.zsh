@@ -251,10 +251,21 @@ run_installer() {
   "$INSTALLER"
 }
 
+establish_armed_session() {
+  set_session inactive
+  set_sleep_disabled_state 0
+  run_watchdog_once
+  set_session active
+  set_sleep_disabled_state 1
+  run_watchdog_once
+  assert_exists "$POWER_PROTECT_STATE_DIR/armed-session" "closed-display transition should arm the watchdog"
+}
+
 setup_case config_validation 0
 assert_succeeds "$WATCHDOG" --validate-config "$POWER_PROTECT_STATE_DIR/config.plist"
 write_config true 2 true
 assert_fails "$WATCHDOG" --validate-config "$POWER_PROTECT_STATE_DIR/config.plist"
+assert_equal false "$(/usr/bin/plutil -extract ResetSleepWhenInactive raw -o - "$REPO_ROOT/Source/Watchdog/config.plist")" "the shipped default must preserve unowned external power state"
 
 setup_case ordinary_session_unarmed 0
 run_watchdog_once
@@ -262,27 +273,57 @@ assert_equal 0 "$(<"$FAKE_PMSET_STATE")" "a generic Amphetamine session must not
 assert_not_exists "$POWER_PROTECT_STATE_DIR/armed-session" "an unobserved closed-display intent must remain unarmed"
 assert_not_exists "$POWER_PROTECT_STATE_DIR/sleep-disabled-owned" "an ordinary session must not claim ownership"
 
-setup_case arm_and_reassert 1
+setup_case preexisting_sleep_disabled_unarmed 1
 run_watchdog_once
+assert_equal 1 "$(<"$FAKE_PMSET_STATE")" "a pre-existing external SleepDisabled value must be preserved"
+assert_not_exists "$POWER_PROTECT_STATE_DIR/armed-session" "a pre-existing SleepDisabled value must not prove closed-display intent"
+assert_not_exists "$POWER_PROTECT_STATE_DIR/sleep-disabled-owned" "an unproven external state must remain unowned"
+
+setup_case unarmed_unreadable_power_preserved 1
+set_power_unavailable
+run_watchdog_once
+assert_equal 1 "$(<"$FAKE_PMSET_STATE")" "unreadable power telemetry must not reset an unarmed external SleepDisabled value"
+assert_not_exists "$FAKE_PMSET_CHANGES" "unarmed power fail-safe must not invoke pmset"
+
+setup_case unarmed_low_battery_preserved 1
+set_power_source "Battery Power" 5
+run_watchdog_once
+assert_equal 1 "$(<"$FAKE_PMSET_STATE")" "low battery handling must not reset an unarmed external SleepDisabled value"
+assert_not_exists "$FAKE_PMSET_CHANGES" "unarmed low-battery handling must not invoke pmset"
+
+setup_case candidate_transition 0
+set_session inactive
+run_watchdog_once
+set_session active
+run_watchdog_once
+assert_exists "$POWER_PROTECT_STATE_DIR/arm-candidate" "a new assertion after a safe baseline should open a bounded arm window"
+set_sleep_disabled_state 1
+run_watchdog_once
+assert_equal "123:0x1" "$(<"$POWER_PROTECT_STATE_DIR/armed-session")" "a candidate Power Protect transition should arm the matching assertion"
+
+setup_case arm_and_reassert 0
+establish_armed_session
 assert_equal "123:0x1" "$(<"$POWER_PROTECT_STATE_DIR/armed-session")" "observed Power Protect state should arm this assertion identity"
 assert_exists "$POWER_PROTECT_STATE_DIR/sleep-disabled-owned" "arming should claim managed-state ownership"
 set_sleep_disabled_state 0
 run_watchdog_once
 assert_equal 1 "$(<"$FAKE_PMSET_STATE")" "an armed session should repair a reset SleepDisabled value"
 
-setup_case large_assertion_output 1
+setup_case large_assertion_output 0
+establish_armed_session
 append_assertion_noise
-run_watchdog_once
 set_sleep_disabled_state 0
 run_watchdog_once
 assert_equal 1 "$(<"$FAKE_PMSET_STATE")" "large assertion output must not hide the armed Amphetamine session"
 
-setup_case session_identity_change 1
-run_watchdog_once
+setup_case session_identity_change 0
+establish_armed_session
 set_session active 0x9
 set_sleep_disabled_state 1
 run_watchdog_once
-assert_equal "123:0x9" "$(<"$POWER_PROTECT_STATE_DIR/armed-session")" "a replacement assertion should receive a new arm identity"
+assert_equal 0 "$(<"$FAKE_PMSET_STATE")" "an assertion identity change must release watchdog-owned sleep state"
+assert_not_exists "$POWER_PROTECT_STATE_DIR/armed-session" "a replacement assertion must not inherit closed-display intent"
+assert_not_exists "$POWER_PROTECT_STATE_DIR/sleep-disabled-owned" "identity-change cleanup must release ownership"
 
 setup_case unowned_inactive 1
 set_session inactive
@@ -296,16 +337,17 @@ run_watchdog_once
 assert_equal 1 "$(<"$FAKE_PMSET_STATE")" "inactive reset opt-out should preserve unowned SleepDisabled"
 assert_not_exists "$FAKE_PMSET_CHANGES" "inactive reset opt-out must not call pmset for unowned state"
 
-setup_case owned_inactive 1
-run_watchdog_once
+setup_case owned_inactive 0
+write_config true 35 false
+establish_armed_session
 set_session inactive
 run_watchdog_once
 assert_equal 0 "$(<"$FAKE_PMSET_STATE")" "inactive session should clean managed SleepDisabled"
 assert_not_exists "$POWER_PROTECT_STATE_DIR/sleep-disabled-owned" "inactive cleanup should remove ownership"
 assert_not_exists "$POWER_PROTECT_STATE_DIR/armed-session" "inactive cleanup should clear the assertion identity"
 
-setup_case low_battery 1
-run_watchdog_once
+setup_case low_battery 0
+establish_armed_session
 set_power_source "Battery Power" 35
 run_watchdog_once
 assert_equal 0 "$(<"$FAKE_PMSET_STATE")" "low battery should restore system sleep"
@@ -316,8 +358,8 @@ run_watchdog_once
 assert_equal 1 "$(<"$FAKE_PMSET_STATE")" "AC power should clear the latch and restore an armed session"
 assert_not_exists "$POWER_PROTECT_STATE_DIR/low-battery-latched" "AC power should clear the low-battery latch"
 
-setup_case low_battery_latch_failure 1
-run_watchdog_once
+setup_case low_battery_latch_failure 0
+establish_armed_session
 set_power_source "Battery Power" 35
 set_touch_failure low-battery-latched
 assert_fails run_watchdog_once
@@ -325,14 +367,18 @@ assert_equal 0 "$(<"$FAKE_PMSET_STATE")" "latch-write failure must still restore
 assert_not_exists "$POWER_PROTECT_STATE_DIR/low-battery-latched" "failed latch creation must be observable"
 assert_not_exists "$POWER_PROTECT_STATE_DIR/sleep-disabled-owned" "failed latch creation must release ownership"
 
-setup_case ownership_marker_failure 1
+setup_case ownership_marker_failure 0
+set_session inactive
+run_watchdog_once
+set_session active
+set_sleep_disabled_state 1
 set_touch_failure sleep-disabled-owned
 assert_fails run_watchdog_once
 assert_equal 0 "$(<"$FAKE_PMSET_STATE")" "ownership-marker failure must fail safe instead of leaving closed-display mode enabled"
 assert_not_exists "$POWER_PROTECT_STATE_DIR/armed-session" "failed ownership must not arm the session"
 
-setup_case unreadable_power 1
-run_watchdog_once
+setup_case unreadable_power 0
+establish_armed_session
 set_power_unavailable
 assert_fails run_watchdog_once
 assert_equal 0 "$(<"$FAKE_PMSET_STATE")" "unreadable power state must fail safe"
@@ -341,36 +387,36 @@ set_power_source "Battery Power" 78
 run_watchdog_once
 assert_equal 1 "$(<"$FAKE_PMSET_STATE")" "an armed session should recover after power telemetry returns"
 
-setup_case unreadable_assertions 1
-run_watchdog_once
+setup_case unreadable_assertions 0
+establish_armed_session
 /bin/rm -f "$FAKE_PMSET_ASSERTIONS"
 assert_fails run_watchdog_once
 assert_equal 0 "$(<"$FAKE_PMSET_STATE")" "unreadable assertion state should release managed sleep state"
 assert_not_exists "$POWER_PROTECT_STATE_DIR/armed-session" "unreadable assertion state should clear stale intent"
 
-setup_case unreadable_sleep_state 1
-run_watchdog_once
+setup_case unreadable_sleep_state 0
+establish_armed_session
 print -r -- "unknown" > "$FAKE_PMSET_STATE"
 assert_fails run_watchdog_once
 assert_equal 0 "$(<"$FAKE_PMSET_STATE")" "unreadable SleepDisabled should attempt and verify a fail-safe reset"
 
-setup_case enable_sudo_failure 1
-run_watchdog_once
+setup_case enable_sudo_failure 0
+establish_armed_session
 set_sleep_disabled_state 0
 set_sudo_failure
 assert_fails run_watchdog_once
 assert_equal 0 "$(<"$FAKE_PMSET_STATE")" "failed authorization must not claim that sleep was disabled"
 assert_exists "$POWER_PROTECT_STATE_DIR/sleep-disabled-owned" "managed ownership must survive a transient reassertion failure"
 
-setup_case cleanup_sudo_failure 1
-run_watchdog_once
+setup_case cleanup_sudo_failure 0
+establish_armed_session
 set_sudo_failure
 assert_fails run_watchdog_cleanup
 assert_equal 1 "$(<"$FAKE_PMSET_STATE")" "failed cleanup must preserve the actual state for a later retry"
 assert_exists "$POWER_PROTECT_STATE_DIR/sleep-disabled-owned" "failed cleanup must retain ownership"
 
-setup_case pmset_verification_failure 1
-run_watchdog_once
+setup_case pmset_verification_failure 0
+establish_armed_session
 set_sleep_disabled_state 0
 "$TOUCH_REAL" "$FAKE_PMSET_IGNORE_WRITES"
 assert_fails run_watchdog_once
@@ -393,15 +439,15 @@ run_watchdog_once
 assert_equal 1 "$(<"$FAKE_PMSET_STATE")" "a background user's disabled cleanup must not alter the active console user's global state"
 assert_not_exists "$POWER_PROTECT_STATE_DIR/disabled-cleaned" "background user must defer disabled cleanup until active"
 
-setup_case invalid_config_cleanup 1
-run_watchdog_once
+setup_case invalid_config_cleanup 0
+establish_armed_session
 print -r -- "not a plist" > "$POWER_PROTECT_STATE_DIR/config.plist"
 assert_fails run_watchdog_once
 assert_equal 0 "$(<"$FAKE_PMSET_STATE")" "invalid configuration should release managed state"
 assert_not_exists "$POWER_PROTECT_STATE_DIR/sleep-disabled-owned" "invalid configuration cleanup should release ownership"
 
-setup_case non_console_user 1
-run_watchdog_once
+setup_case non_console_user 0
+establish_armed_session
 export POWER_PROTECT_CONSOLE_UID=502
 run_watchdog_once
 assert_equal 0 "$(<"$FAKE_PMSET_STATE")" "a background GUI user should release its managed global state"
@@ -458,11 +504,13 @@ assert_fails run_installer
 assert_not_exists "$FAKE_LAUNCHCTL_ACTIONS" "invalid config should fail before launchctl mutation"
 
 setup_case installer_success 0
+export POWER_PROTECT_INSTALL_DIR="${POWER_PROTECT_INSTALL_DIR:h}/install with spaces"
 export POWER_PROTECT_STATE_DIR="$POWER_PROTECT_INSTALL_DIR"
 write_config_to "$POWER_PROTECT_INSTALL_DIR" true 35 true
 run_installer
 assert_exists "$POWER_PROTECT_INSTALL_DIR/power-protect-watchdog.zsh" "installer should deploy the watchdog"
 assert_exists "$POWER_PROTECT_LAUNCH_AGENT" "installer should deploy the LaunchAgent"
+assert_equal "$POWER_PROTECT_INSTALL_DIR/power-protect-watchdog.zsh" "$(/usr/bin/plutil -extract ProgramArguments.0 raw -o - "$POWER_PROTECT_LAUNCH_AGENT")" "LaunchAgent should execute the installed absolute path without shell expansion"
 assert_succeeds "$POWER_PROTECT_INSTALL_DIR/power-protect-watchdog.zsh" --healthcheck
 
 print -r -- "PASS: Power Protect watchdog regression tests"
